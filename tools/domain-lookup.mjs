@@ -322,3 +322,164 @@ export async function findBusinessByDomain(target = {}, deps = {}) {
       + 'Check by hand before drawing any conclusion.',
   };
 }
+
+// --- CLI ---------------------------------------------------------------------
+//
+// Exists to serve the standing rule: no automated finding reaches a prospect
+// without a hand check. Paste the SERP rows you already have and ask which one
+// actually belongs to the domain, without spending a credit to re-fetch them.
+//
+//   node tools/domain-lookup.mjs --domain derby-kitchens.com --rows rows.json
+//   some-fetch | node tools/domain-lookup.mjs --domain derby-kitchens.com --rows -
+
+/** 0 = a listing matched. Not an assertion about anything else. */
+export const EXIT_FOUND = 0;
+/** 2 = the invocation was wrong (bad flag, unreadable rows). */
+export const EXIT_USAGE = 2;
+/** 3 = nothing matched. NOT "no listing exists" — see the note on the result. */
+export const EXIT_INCONCLUSIVE = 3;
+
+export const USAGE = `Find a Google Business Profile by domain rather than by name.
+
+  node tools/domain-lookup.mjs --domain <domain> [--name <trading name>]
+                               --rows <file|-> [--json]
+
+  --domain  the website whose listing you are looking for   (required)
+  --name    the trading name, if you know it
+  --rows    JSON array of SERP rows, or a {businesses:[...]} object;
+            "-" reads stdin                                  (required)
+  --json    emit the raw result object instead of a summary
+
+Exit: 0 matched, 3 no match (NOT proof of absence), 2 bad invocation.`;
+
+/** Parse argv into options. Pure, so the tests can reach it. */
+export function parseArgs(argv) {
+  const options = { domain: null, name: null, rows: null, json: false, help: false };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const flag = argv[i];
+    const value = () => {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('--')) throw new Error(`${flag} needs a value`);
+      i += 1;
+      return next;
+    };
+
+    switch (flag) {
+      case '--domain': options.domain = value(); break;
+      case '--name': options.name = value(); break;
+      case '--rows': options.rows = value(); break;
+      case '--json': options.json = true; break;
+      case '--help':
+      case '-h': options.help = true; break;
+      default: throw new Error(`unknown argument: ${flag}`);
+    }
+  }
+
+  return options;
+}
+
+/** Render a result for a human deciding whether to trust it. */
+export function formatResult(result) {
+  const lines = [];
+
+  if (result.status === 'found') {
+    lines.push(`MATCHED  ${result.domain}`);
+    for (const match of result.matches) {
+      lines.push(`  ${match.name ?? '(unnamed)'}`);
+      lines.push(`    cid ${match.cid ?? '—'}   place_id ${match.placeId ?? '—'}`);
+      lines.push(`    found via ${match.matchedVia} query "${match.matchedQuery}"`);
+      if (match.nameDiffersFromQuery) {
+        // The Duffield signature: a name-keyed check would have missed this.
+        lines.push('    NOTE: listing name differs from the query — a name-only lookup would have missed it.');
+      }
+    }
+  } else if (result.status === 'invalid_domain') {
+    lines.push(`BAD DOMAIN  ${result.domain ?? '(none given)'}`);
+  } else {
+    lines.push(`NO MATCH  ${result.domain}`);
+    lines.push('  Queries tried:');
+    for (const attempt of result.attempts) {
+      const outcome = attempt.error ? `error: ${attempt.error}` : `${attempt.rowsReturned} rows, ${attempt.matched} matched`;
+      lines.push(`    "${attempt.query}" (${attempt.source}) — ${outcome}`);
+    }
+  }
+
+  lines.push('');
+  lines.push(result.note);
+
+  return lines.join('\n');
+}
+
+/** Rows in, rows out — the CLI already has them, so no search is bought. */
+export function rowsAsSearch(rows) {
+  return async () => rows;
+}
+
+async function main(argv) {
+  let options;
+  try {
+    options = parseArgs(argv);
+  } catch (error) {
+    process.stderr.write(`${error.message}\n\n${USAGE}\n`);
+    return EXIT_USAGE;
+  }
+
+  if (options.help) {
+    process.stdout.write(`${USAGE}\n`);
+    return EXIT_FOUND;
+  }
+
+  if (options.domain === null || options.rows === null) {
+    process.stderr.write(`--domain and --rows are both required\n\n${USAGE}\n`);
+    return EXIT_USAGE;
+  }
+
+  const { readFile } = await import('node:fs/promises');
+  let raw;
+  try {
+    raw = options.rows === '-'
+      ? await new Promise((resolve, reject) => {
+          let buffer = '';
+          process.stdin.setEncoding('utf8');
+          process.stdin.on('data', (chunk) => { buffer += chunk; });
+          process.stdin.on('end', () => resolve(buffer));
+          process.stdin.on('error', reject);
+        })
+      : await readFile(options.rows, 'utf8');
+  } catch (error) {
+    process.stderr.write(`could not read rows: ${error.message}\n`);
+    return EXIT_USAGE;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    process.stderr.write(`rows are not valid JSON: ${error.message}\n`);
+    return EXIT_USAGE;
+  }
+
+  const rows = Array.isArray(parsed) ? parsed : parsed?.businesses;
+  if (!Array.isArray(rows)) {
+    process.stderr.write('rows must be a JSON array, or an object with a "businesses" array\n');
+    return EXIT_USAGE;
+  }
+
+  const result = await findBusinessByDomain(
+    { domain: options.domain, name: options.name ?? undefined },
+    { searchLocalBusinesses: rowsAsSearch(rows) },
+  );
+
+  process.stdout.write(options.json
+    ? `${JSON.stringify(result, null, 2)}\n`
+    : `${formatResult(result)}\n`);
+
+  if (result.status === 'found') return EXIT_FOUND;
+  if (result.status === 'invalid_domain') return EXIT_USAGE;
+  return EXIT_INCONCLUSIVE;
+}
+
+if (import.meta.filename === process.argv[1]) {
+  process.exitCode = await main(process.argv.slice(2));
+}

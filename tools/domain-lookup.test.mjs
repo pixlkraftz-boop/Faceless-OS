@@ -16,6 +16,12 @@ import {
   buildQueryPlan,
   findBusinessByDomain,
   DEFAULT_RADIUS_METERS,
+  parseArgs,
+  formatResult,
+  rowsAsSearch,
+  EXIT_FOUND,
+  EXIT_USAGE,
+  EXIT_INCONCLUSIVE,
 } from './domain-lookup.mjs';
 
 let passed = 0;
@@ -273,6 +279,69 @@ await test('an unreadable domain is rejected before any credit is spent', async 
 
 await test('a missing search dependency fails loudly at the call site', async () => {
   await assert.rejects(() => findBusinessByDomain({ domain: 'example.com' }, {}), TypeError);
+});
+
+// --- CLI ---------------------------------------------------------------------
+
+await test('flags parse into options', () => {
+  const options = parseArgs(['--domain', 'derby-kitchens.com', '--name', 'Duffield Kitchens', '--rows', '-', '--json']);
+  assert.equal(options.domain, 'derby-kitchens.com');
+  assert.equal(options.name, 'Duffield Kitchens');
+  assert.equal(options.rows, '-');
+  assert.equal(options.json, true);
+});
+
+await test('a flag swallowing the next flag as its value is rejected', () => {
+  // `--domain --rows x` must not silently set domain to "--rows".
+  assert.throws(() => parseArgs(['--domain', '--rows', 'x']), /needs a value/);
+  assert.throws(() => parseArgs(['--domain']), /needs a value/);
+});
+
+await test('an unknown flag is rejected rather than ignored', () => {
+  assert.throws(() => parseArgs(['--bogus', 'x']), /unknown argument/);
+});
+
+await test('the exit code for "no match" is neither success nor a usage error', () => {
+  // Collapsing these would make a miss indistinguishable from a hit or a crash.
+  assert.notEqual(EXIT_INCONCLUSIVE, EXIT_FOUND);
+  assert.notEqual(EXIT_INCONCLUSIVE, EXIT_USAGE);
+  assert.equal(EXIT_FOUND, 0);
+});
+
+await test('a match is rendered with its cid and the name-mismatch warning', async () => {
+  const rows = [{ name: 'Duffield Kitchens', url: 'https://www.derby-kitchens.com/', cid: '333' }];
+  const result = await findBusinessByDomain(
+    { domain: 'derby-kitchens.com' },
+    { searchLocalBusinesses: rowsAsSearch(rows) },
+  );
+  const text = formatResult(result);
+  assert.match(text, /MATCHED/);
+  assert.match(text, /Duffield Kitchens/);
+  assert.match(text, /cid 333/);
+  assert.match(text, /listing name differs from the query/);
+});
+
+await test('rendered output of a miss never claims the listing does not exist', async () => {
+  const result = await findBusinessByDomain(
+    { domain: 'derby-kitchens.com' },
+    { searchLocalBusinesses: rowsAsSearch([{ name: 'Ascot', domain: 'abkkitchens.co.uk' }]) },
+  );
+  const text = formatResult(result);
+  assert.match(text, /NO MATCH/);
+  assert.match(text, /not evidence that no listing exists/i);
+  assert.doesNotMatch(text, /has no (google )?listing/i);
+  // The queries tried must be on screen so the miss can be checked by hand.
+  assert.match(text, /derby kitchens/);
+});
+
+await test('every rendered result carries its hand-check note', async () => {
+  for (const rows of [[{ name: 'Duffield Kitchens', domain: 'derby-kitchens.com', cid: '1' }], []]) {
+    const result = await findBusinessByDomain(
+      { domain: 'derby-kitchens.com' },
+      { searchLocalBusinesses: rowsAsSearch(rows) },
+    );
+    assert.ok(formatResult(result).includes(result.note), 'the note must reach the screen');
+  }
 });
 
 // --- report ------------------------------------------------------------------
